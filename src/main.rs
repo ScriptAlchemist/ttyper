@@ -1,17 +1,20 @@
 /*
 ttyper/src/main.rs
 
-Main entry point for ttyper with updated save/resume/delete prompt loop.
+Main entry point for ttyper with PDF extraction integration.
 
-This file was rebuilt to ensure that when the user deletes a save during the
-multiple-save prompt, the program returns to the save-choices prompt (instead
-of continuing to start the test). The user can delete multiple saves in a row,
-choose a save to resume, create a new named save, or continue without loading.
+This file integrates PDF extraction and formatting into `gen_contents()`:
+- If the `contents` argument points to a `.pdf` file, the program will attempt to
+  extract and clean text (via the `extraction` and `format` modules).
+- If a `--pdf-cache-dir` is provided, extracted text will be cached there and reused.
+- If extraction fails, the code falls back to reading the file as plain text.
 
-Note: this file is the full source for the main binary.
+It also retains autosave / resume / multiple-save selection and deletion behavior.
 */
 
 mod config;
+mod extraction;
+mod format;
 mod save;
 mod test;
 mod ui;
@@ -93,25 +96,72 @@ struct Opt {
     /// Disable the prompt to resume from save file
     #[arg(long)]
     no_resume_prompt: bool,
+
+    /// Cache directory for extracted PDF text files (optional).
+    /// When provided PDF extraction will write/read cleaned text files here.
+    #[arg(long, value_name = "PATH")]
+    pdf_cache_dir: Option<PathBuf>,
+
+    /// If input is a PDF, starting page (1-based)
+    #[arg(long)]
+    pdf_start: Option<u32>,
+
+    /// If input is a PDF, ending page (1-based)
+    #[arg(long)]
+    pdf_end: Option<u32>,
 }
 
 impl Opt {
     fn gen_contents(&self) -> Option<Vec<String>> {
         match &self.contents {
             Some(path) => {
-                let lines: Vec<String> = if path.as_os_str() == "-" {
-                    std::io::stdin()
+                // If stdin, read lines from stdin as before.
+                if path.as_os_str() == "-" {
+                    let lines: Vec<String> = std::io::stdin()
                         .lock()
                         .lines()
                         .map_while(Result::ok)
-                        .collect()
-                } else {
-                    let file = fs::File::open(path).expect("Error reading language file.");
-                    io::BufReader::new(file)
-                        .lines()
-                        .map_while(Result::ok)
-                        .collect()
-                };
+                        .collect();
+                    return Some(lines.iter().map(String::from).collect());
+                }
+
+                // If the provided path is a PDF file, attempt extraction via extraction::extract_and_format
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+
+                if ext == "pdf" {
+                    // Use the user-specified cache directory if provided
+                    let cache_dir = self.pdf_cache_dir.as_deref();
+                    if let Ok(text) = extraction::extract_and_format(
+                        path,
+                        cache_dir,
+                        self.pdf_start,
+                        self.pdf_end,
+                    ) {
+                        // The extraction/format pipeline returns cleaned text where paragraphs are on separate lines.
+                        // Split on newlines into Vec<String> and return.
+                        let lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
+                        return Some(lines);
+                    } else {
+                        // If extraction failed, fall back to reading the file as text (best-effort).
+                        if let Ok(s) = fs::read_to_string(path) {
+                            let lines: Vec<String> = s.lines().map(|s| s.to_string()).collect();
+                            return Some(lines);
+                        } else {
+                            return None;
+                        }
+                    }
+                }
+
+                // Default: read the file as plain text
+                let file = fs::File::open(path).expect("Error reading language file.");
+                let lines: Vec<String> = io::BufReader::new(file)
+                    .lines()
+                    .map_while(Result::ok)
+                    .collect();
 
                 Some(lines.iter().map(String::from).collect())
             }
@@ -265,6 +315,43 @@ fn prompt_input_name() -> io::Result<Option<String>> {
     }
 }
 
+/// Prompt user to choose among saves (returns Some(index) or None)
+fn prompt_choose_save(
+    choices: &Vec<(std::path::PathBuf, save::SaveState)>,
+) -> io::Result<Option<usize>> {
+    for (i, (path, state)) in choices.iter().enumerate() {
+        // Use timestamp number for display (no chrono dependency)
+        let t = state.timestamp.to_string();
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("<unknown>");
+        execute!(
+            io::stdout(),
+            Print(format!("  [{}] {} (saved {})\n", i + 1, file_name, t))
+        )?;
+    }
+    execute!(
+        io::stdout(),
+        Print("Choose save number to resume, or 'n' to start fresh: ")
+    )?;
+    use std::io::Write;
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let trimmed = input.trim();
+    if trimmed.eq_ignore_ascii_case("n") || trimmed.is_empty() {
+        return Ok(None);
+    }
+    if let Ok(idx) = trimmed.parse::<usize>() {
+        if idx >= 1 && idx <= choices.len() {
+            return Ok(Some(idx - 1));
+        }
+    }
+    Ok(None)
+}
+
 fn main() -> io::Result<()> {
     let opt = Opt::parse();
     if opt.debug {
@@ -331,15 +418,13 @@ fn main() -> io::Result<()> {
                     terminal::disable_raw_mode()?;
                     execute!(io::stdout(), cursor::Show, terminal::LeaveAlternateScreen,)?;
 
-                    // Loop the prompt so that deletion returns to the choices instead of starting the test.
+                    // Loop prompt so deletion returns to choices rather than starting the test
                     loop {
-                        // If all saves have been deleted, stop prompting.
                         if saves.is_empty() {
                             break;
                         }
 
                         if saves.len() == 1 {
-                            // Single save: behave like previous prompt, but offer to create a new-named save when the user says no.
                             let (ref path, ref state_saved) = &saves[0];
                             let resume = prompt_resume(path)?;
                             if resume {
@@ -360,28 +445,28 @@ fn main() -> io::Result<()> {
                                     || yn.trim().eq_ignore_ascii_case("yes")
                                 {
                                     if let Some(name) = prompt_input_name()? {
-                                        let new_path =
-                                            save_mgr.save_test_to_name(&test, file_path, &name)?;
-                                        chosen_save_path = Some(new_path);
-                                        writeln!(
-                                            io::stdout(),
-                                            "Saved progress to {}",
-                                            chosen_save_path
-                                                .as_ref()
-                                                .and_then(|p| p.file_name())
-                                                .map(|n| n.to_string_lossy())
-                                                .unwrap_or_else(|| std::borrow::Cow::Borrowed(
-                                                    "<unknown>"
-                                                ))
-                                        )?;
+                                        if let Some(p) =
+                                            save_mgr.save_test_to_name(&test, file_path, &name).ok()
+                                        {
+                                            chosen_save_path = Some(p);
+                                            writeln!(
+                                                io::stdout(),
+                                                "Saved progress to {}",
+                                                chosen_save_path
+                                                    .as_ref()
+                                                    .and_then(|p| p.file_name())
+                                                    .map(|n| n.to_string_lossy())
+                                                    .unwrap_or_else(|| std::borrow::Cow::Borrowed(
+                                                        "<unknown>"
+                                                    ))
+                                            )?;
+                                        }
                                     }
                                 }
-                                // After this single-save branch, regardless of save/no-save,
-                                // return to calling code (do not loop infinitely on single save).
                                 break;
                             }
                         } else {
-                            // Multiple saves: let the user pick one, create a new named save, delete saves, or skip.
+                            // Multiple saves: present choices and accept resume/new/delete
                             writeln!(
                                 io::stdout(),
                                 "Found multiple saved progress files for {}:",
@@ -403,6 +488,7 @@ fn main() -> io::Result<()> {
                                     s.timestamp
                                 )?;
                             }
+
                             use std::io::Write;
                             write!(
                                 io::stdout(),
@@ -412,28 +498,35 @@ fn main() -> io::Result<()> {
                             let mut input = String::new();
                             io::stdin().read_line(&mut input)?;
                             let trimmed = input.trim();
+
                             if trimmed.is_empty() {
                                 // user chose to continue without loading
                                 break;
                             } else if trimmed.eq_ignore_ascii_case("n") {
                                 if let Some(name) = prompt_input_name()? {
-                                    let new_path =
-                                        save_mgr.save_test_to_name(&test, file_path, &name)?;
-                                    chosen_save_path = Some(new_path);
-                                    writeln!(
-                                        io::stdout(),
-                                        "Saved progress to {}",
-                                        chosen_save_path
-                                            .as_ref()
-                                            .and_then(|p| p.file_name())
-                                            .map(|n| n.to_string_lossy())
-                                            .unwrap_or_else(|| std::borrow::Cow::Borrowed(
-                                                "<unknown>"
-                                            ))
-                                    )?;
-                                    break;
+                                    if let Ok(new_path) =
+                                        save_mgr.save_test_to_name(&test, file_path, &name)
+                                    {
+                                        chosen_save_path = Some(new_path);
+                                        writeln!(
+                                            io::stdout(),
+                                            "Saved progress to {}",
+                                            chosen_save_path
+                                                .as_ref()
+                                                .and_then(|p| p.file_name())
+                                                .map(|n| n.to_string_lossy())
+                                                .unwrap_or_else(|| std::borrow::Cow::Borrowed(
+                                                    "<unknown>"
+                                                ))
+                                        )?;
+                                        break;
+                                    } else {
+                                        // failed to write named save -> loop again
+                                        writeln!(io::stdout(), "Failed to save new save file.")?;
+                                        continue;
+                                    }
                                 } else {
-                                    // user canceled naming; loop back to choices
+                                    // user canceled naming; loop again
                                     continue;
                                 }
                             } else if trimmed.starts_with('d') || trimmed.starts_with('D') {
@@ -470,12 +563,10 @@ fn main() -> io::Result<()> {
                                             continue;
                                         }
                                     } else {
-                                        // invalid index; re-display list
                                         writeln!(io::stdout(), "Invalid save number.")?;
                                         continue;
                                     }
                                 } else {
-                                    // couldn't parse number; re-display list
                                     writeln!(io::stdout(), "Invalid delete command.")?;
                                     continue;
                                 }
