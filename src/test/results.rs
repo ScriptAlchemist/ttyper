@@ -130,22 +130,33 @@ impl From<&Test> for Results {
 }
 
 fn render_typed_text(test: &Test) -> String {
-    let separator = if test
+    let is_line_based = test
         .words
         .iter()
-        .any(|word| word.text.chars().any(char::is_whitespace))
-    {
-        "\n"
-    } else {
-        " "
-    };
+        .any(|word| word.text.chars().any(char::is_whitespace));
+
+    if is_line_based {
+        let Some(last_typed_index) = test
+            .words
+            .iter()
+            .rposition(|word| !word.progress.is_empty())
+        else {
+            return String::new();
+        };
+
+        return test.words[..=last_typed_index]
+            .iter()
+            .map(|word| word.progress.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
 
     test.words
         .iter()
         .filter(|word| !word.progress.is_empty())
         .map(|word| word.progress.clone())
         .collect::<Vec<_>>()
-        .join(separator)
+        .join(" ")
 }
 
 fn calc_timing(events: &[&super::TestEvent]) -> TimingData {
@@ -294,5 +305,18 @@ mod tests {
         test.words[1].progress = "second".into();
 
         assert_eq!(render_typed_text(&test), "first\nsecond");
+    }
+
+    #[test]
+    fn render_typed_text_preserves_blank_line_positions() {
+        let mut test = Test::new(
+            vec!["first line".into(), "".into(), "third line".into()],
+            true,
+            false,
+        );
+        test.words[0].progress = "first".into();
+        test.words[2].progress = "third".into();
+
+        assert_eq!(render_typed_text(&test), "first\n\nthird");
     }
 }
