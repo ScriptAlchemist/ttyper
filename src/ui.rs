@@ -11,7 +11,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph, Widget},
 };
-use results::Fraction;
+use results::{displayable_key_char, Fraction};
 
 // Convert CPS to WPM (clicks per second)
 const WPM_PER_CPS: f64 = 12.0;
@@ -364,7 +364,7 @@ impl ThemedWidget for &results::Results {
             .accuracy
             .per_key
             .iter()
-            .filter(|(key, _)| matches!(key.code, KeyCode::Char(_)))
+            .filter(|(key, _)| displayable_key_char(key).is_some())
             .collect();
         worst_keys.sort_unstable_by_key(|x| x.1);
 
@@ -373,16 +373,14 @@ impl ThemedWidget for &results::Results {
             worst_keys
                 .iter()
                 .filter_map(|(key, acc)| {
-                    if let KeyCode::Char(character) = key.code {
+                    displayable_key_char(key).and_then(|character| {
                         let key_accuracy = f64::from(**acc) * 100.0;
                         if key_accuracy != 100.0 {
                             Some(format!("- {} at {:.1}% accuracy", character, key_accuracy))
                         } else {
                             None
                         }
-                    } else {
-                        None
-                    }
+                    })
                 })
                 .take(5)
                 .map(Line::from),

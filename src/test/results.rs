@@ -1,6 +1,6 @@
 use super::{is_missed_word_event, Test};
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::{cmp, fmt};
@@ -84,13 +84,14 @@ impl Results {
             .accuracy
             .per_key
             .iter()
-            .filter_map(|(key, acc)| match key.code {
-                KeyCode::Char(character)
-                    if *acc != Fraction::new(acc.denominator, acc.denominator) =>
-                {
-                    Some((character, *acc))
-                }
-                _ => None,
+            .filter_map(|(key, acc)| {
+                displayable_key_char(key).and_then(|character| {
+                    if *acc != Fraction::new(acc.denominator, acc.denominator) {
+                        Some((character, *acc))
+                    } else {
+                        None
+                    }
+                })
             })
             .collect();
         worst_keys.sort_unstable_by(|(left_char, left_acc), (right_char, right_acc)| {
@@ -112,6 +113,17 @@ impl Results {
         }
 
         summary
+    }
+}
+
+pub fn displayable_key_char(key: &KeyEvent) -> Option<char> {
+    match key.code {
+        KeyCode::Char(character)
+            if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+        {
+            Some(character)
+        }
+        _ => None,
     }
 }
 
@@ -249,6 +261,10 @@ mod tests {
             KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
             Fraction::new(1, 1),
         );
+        per_key.insert(
+            KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL),
+            Fraction::new(0, 1),
+        );
 
         let results = Results {
             typed_text: "alpha beta".into(),
@@ -274,6 +290,7 @@ mod tests {
         assert!(summary.contains("- a at 50.0% accuracy"));
         assert!(summary.contains("- z at 75.0% accuracy"));
         assert!(!summary.contains("- x at 100.0% accuracy"));
+        assert!(!summary.contains("\\"));
         assert!(!summary.contains("Missed Words"));
     }
 
