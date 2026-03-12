@@ -34,7 +34,7 @@ use rust_embed::RustEmbed;
 use std::{
     ffi::OsString,
     fs,
-    io::{self, BufRead},
+    io::{self, BufRead, IsTerminal},
     num,
     path::PathBuf,
     str,
@@ -94,6 +94,14 @@ struct Opt {
     /// Disable the prompt to resume from save file
     #[arg(long)]
     no_resume_prompt: bool,
+
+    /// Run inside the current terminal buffer, exit on completion, and print a text summary
+    #[arg(long)]
+    embed: bool,
+
+    /// Write the final text summary to a file after the test exits
+    #[arg(long, value_name = "PATH")]
+    summary_out: Option<PathBuf>,
 }
 
 impl Opt {
@@ -227,6 +235,54 @@ impl State {
     }
 }
 
+fn enter_ui<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    embed: bool,
+) -> io::Result<()> {
+    terminal::enable_raw_mode()?;
+    execute!(io::stdout(), cursor::Hide)?;
+
+    if !embed {
+        execute!(
+            io::stdout(),
+            cursor::SavePosition,
+            terminal::EnterAlternateScreen,
+        )?;
+    }
+
+    terminal.clear()?;
+    Ok(())
+}
+
+fn suspend_ui(embed: bool) -> io::Result<()> {
+    terminal::disable_raw_mode()?;
+
+    if embed {
+        execute!(io::stdout(), cursor::Show)?;
+    } else {
+        execute!(io::stdout(), cursor::Show, terminal::LeaveAlternateScreen)?;
+    }
+
+    Ok(())
+}
+
+fn restore_ui(embed: bool) -> io::Result<()> {
+    terminal::disable_raw_mode()?;
+
+    if embed {
+        execute!(io::stdout(), cursor::Show, cursor::MoveToNextLine(1))?;
+    } else {
+        execute!(
+            io::stdout(),
+            cursor::RestorePosition,
+            cursor::Show,
+            terminal::LeaveAlternateScreen,
+        )?;
+    }
+
+    Ok(())
+}
+
 /// Prompt user whether to resume from save file (simple yes/no)
 fn prompt_resume(file_path: &std::path::Path) -> io::Result<bool> {
     execute!(
@@ -285,6 +341,13 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
 
+    if !io::stdout().is_terminal() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "ttyper needs a real terminal UI. Use :terminal ttyper --embed ... in Neovim instead of :.! or !!.",
+        ));
+    }
+
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
@@ -303,17 +366,11 @@ fn main() -> io::Result<()> {
 
     let input_file_path = opt.contents.as_ref();
 
-    terminal::enable_raw_mode()?;
-    execute!(
-        io::stdout(),
-        cursor::Hide,
-        cursor::SavePosition,
-        terminal::EnterAlternateScreen,
-    )?;
-    terminal.clear()?;
+    enter_ui(&mut terminal, opt.embed)?;
 
     // Track which save file (if any) we should use for autosave / deletion.
     let mut active_save_path: Option<PathBuf> = None;
+    let mut summary_to_print: Option<Results> = None;
 
     let mut state = State::Test({
         let mut test = Test::new(contents.clone(), !opt.no_backtrack, opt.sudden_death);
@@ -329,8 +386,7 @@ fn main() -> io::Result<()> {
 
                 if !opt.no_resume_prompt {
                     // Temporarily restore terminal to show prompt
-                    terminal::disable_raw_mode()?;
-                    execute!(io::stdout(), cursor::Show, terminal::LeaveAlternateScreen,)?;
+                    suspend_ui(opt.embed)?;
 
                     // Loop the prompt so that deletion returns to the choices instead of starting the test.
                     loop {
@@ -499,14 +555,7 @@ fn main() -> io::Result<()> {
                     } // end loop
 
                     // Re-enable raw mode and alternate screen
-                    terminal::enable_raw_mode()?;
-                    execute!(
-                        io::stdout(),
-                        cursor::Hide,
-                        cursor::SavePosition,
-                        terminal::EnterAlternateScreen,
-                    )?;
-                    terminal.clear()?;
+                    enter_ui(&mut terminal, opt.embed)?;
                 } else {
                     // No prompt: auto-resume using the most recent save
                     let last = saves.last().unwrap();
@@ -560,7 +609,12 @@ fn main() -> io::Result<()> {
                             }
                         }
                         test.set_timer_active(false);
-                        state = State::Results(Results::from(&*test));
+                        let results = Results::from(&*test);
+                        if opt.embed {
+                            summary_to_print = Some(results);
+                            break;
+                        }
+                        state = State::Results(results);
                     }
                     State::Results(_) => break,
                 },
@@ -604,7 +658,12 @@ fn main() -> io::Result<()> {
                                     }
                                 }
                             }
-                            state = State::Results(Results::from(&*test));
+                            let results = Results::from(&*test);
+                            if opt.embed {
+                                summary_to_print = Some(results);
+                                break;
+                            }
+                            state = State::Results(results);
                         }
                     }
                 }
@@ -674,13 +733,17 @@ fn main() -> io::Result<()> {
         }
     }
 
-    terminal::disable_raw_mode()?;
-    execute!(
-        io::stdout(),
-        cursor::RestorePosition,
-        cursor::Show,
-        terminal::LeaveAlternateScreen,
-    )?;
+    restore_ui(opt.embed)?;
+
+    if let Some(results) = summary_to_print {
+        let summary = results.plain_text_summary();
+
+        if let Some(path) = &opt.summary_out {
+            fs::write(path, &summary)?;
+        }
+
+        println!("{}", summary);
+    }
 
     Ok(())
 }

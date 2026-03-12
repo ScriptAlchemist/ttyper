@@ -65,6 +65,8 @@ FLAGS:
         --no-resume-prompt  Disable the prompt to resume from save file
         --scroll-mode       Keep current word at top of display (useful for long texts)
         --sudden-death      Enable sudden death mode to restart on first error
+        --embed             Run inside the current terminal buffer, exit on completion, and print a text summary
+        --summary-out <PATH>  Write the final text summary to a file after the test exits
     -V, --version           Prints version information
 
 OPTIONS:
@@ -89,6 +91,54 @@ ARGS:
 | `ttyper text.txt --scroll-mode`                 |   keep current line at top for long texts |
 | `ttyper text.txt --autosave`                    |       save progress and resume on restart |
 | `ttyper text.txt --autosave --no-resume-prompt` |                auto-resume without asking |
+| `ttyper text.txt --embed`                       |  keep output in a terminal buffer on exit |
+
+## neovim
+
+For an interactive Neovim workflow, run `ttyper` in a terminal buffer:
+
+```vim
+:terminal ttyper --embed typing_challenge.txt
+```
+
+`--embed` keeps the app interactive, skips the alternate screen, exits as soon as the challenge ends, and prints a plain-text results summary into the same terminal buffer.
+
+If the terminal opens but your keystrokes are not reaching `ttyper`, enter terminal-input mode with `i` or run `:startinsert`.
+
+`!!ttyper ...` is not a good fit for this because `!!` is a shell filter, not an interactive terminal session.
+
+If you want the finished text pasted into your original Neovim buffer, use `termopen()` and `--summary-out`:
+
+```lua
+vim.api.nvim_create_user_command("TtyperPaste", function(opts)
+  local source = opts.args ~= "" and opts.args or vim.api.nvim_buf_get_name(0)
+  local target_buf = vim.api.nvim_get_current_buf()
+  local insert_at = vim.api.nvim_win_get_cursor(0)[1]
+  local summary_file = vim.fn.tempname()
+
+  vim.cmd("botright split")
+  local term_buf = vim.api.nvim_get_current_buf()
+
+  vim.fn.termopen({ "ttyper", "--embed", "--summary-out", summary_file, source }, {
+    on_exit = function()
+      vim.schedule(function()
+        local lines = vim.fn.readfile(summary_file)
+        vim.fn.delete(summary_file)
+        if vim.api.nvim_buf_is_valid(target_buf) then
+          vim.api.nvim_buf_set_lines(target_buf, insert_at, insert_at, false, lines)
+        end
+        if vim.api.nvim_buf_is_valid(term_buf) then
+          vim.api.nvim_buf_delete(term_buf, { force = true })
+        end
+      end)
+    end,
+  })
+
+  vim.cmd("startinsert")
+end, { nargs = "?" })
+```
+
+Run `:TtyperPaste path/to/typing_challenge.txt` to start the interactive test and append the finished text plus results into the current buffer when the terminal closes.
 
 ## languages
 
